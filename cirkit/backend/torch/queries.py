@@ -13,6 +13,7 @@ from cirkit.backend.torch.layers import (
     TorchInnerLayer,
     TorchInputLayer,
     TorchSumLayer,
+    TorchHadamardLayer,
     TorchLayer,
 )
 from cirkit.utils.scope import Scope
@@ -439,3 +440,123 @@ def _append_selection(
         )
     else:
         selections[mid] = (sample_ids, folds, units)
+
+
+class ApproximateMAPQuery(Query):
+    """The approximate MAP query object."""
+
+    def __init__(self, circuit: TorchCircuit) -> None:
+        """Initialize an approximate MAP query object.
+
+        Args:
+            circuit: The circuit to compute the approximate MAP of.
+
+        Raises:
+            ValueError: If the circuit is not normalised.
+        """
+        if not circuit.properties.smooth or not circuit.properties.decomposable:
+            raise ValueError(
+                f"The circuit to sample from must be smooth and decomposable, "
+                f"but found {circuit.properties}"
+            )
+
+        super().__init__()
+        self._circuit = circuit
+
+    def __call__(self, evidence: Tensor | None = None, ev_mask: Tensor | None = None) -> Tensor:
+        """Compute the approximate MAP given some evidence.
+
+        Args:
+            evidence:    The evidence to condition on, of size (num_evidence, num_variables).
+            ev_mask:     The mask of which variables _are_ evidence and which ones are not.
+                         (same shape as evidence)
+
+        Return:
+            A pair (samples, mixture_samples), consisting of:
+                (i) an assignment to the observed variables the circuit is defined on, and
+                (ii) the samples of the finitely-discrete latent variables associated to the sum units.
+            The samples (i) are returned as a tensor of shape (num_samples, num_variables)
+            if evidence is None and (num_samples, num_evidence, num_variables) otherwise.
+            In backward mode `mixture_samples` is always an empty list.
+
+        Raises:
+            TODO
+        """
+
+        assert (evidence is None) == (ev_mask is None), "Both evidence and evidence_mask \
+                                                        should be None or not simultaneously."
+
+        # samples: (O, K, 1, E?, D)
+        # O: (probably) number of output variables
+        samples = self._circuit.evaluate(
+            *([evidence, ev_mask] if evidence is not None else []),
+            module_fn=self._layer_fn,
+        )
+
+        # TODO: determine correct sample shapes
+        # samples: (O, K, 1, E?, D)
+        # -> (K, 1, E?, O, D)
+        # -> (1, E?, O, K, D)
+        samples = samples.movedim(0, -2).movedim(0, -2)
+        # TODO: fix for the case of multi-output circuits, i.e., O != 1 or K != 1
+        # -> (1, E?, D)
+        samples = samples[..., 0, 0, :]  # (num_samples, D)
+        if evidence is not None:
+            evidence = evidence[None,]
+            samples = samples.where(~ev_mask[None,], evidence)
+        return samples
+
+    def _layer_fn(
+        self, layer: TorchLayer, *inputs: Tensor,
+    ) -> Tensor:
+        # Compute the maximiser of an input layer
+        if isinstance(layer, TorchInputLayer):
+            assert len(inputs) <= 2  # Receive at most maximisers and evidence scores
+            samples, ev_score = layer.compute_maximiser_and_eval_evidence(*inputs)
+            # Fill scope variable with samples and pad remaining variables
+            samples = self._pad_samples(
+                samples,
+                layer.scope_idx,
+                value=layer.semiring.multiplicative_identity
+            )
+            # mixture_samples.append(samples)
+            # padded samples: (F, K, 1, E?, D)
+            # ev_score: (F, K)
+            if len(inputs) == 2:
+                ev_score = ev_score.expand_as(samples[...,-1])
+                assert ev_score.shape == samples.shape[:-1]
+
+                return samples, ev_score
+
+            return samples,
+
+        # Propagate maximisers through inner layers
+        assert len(inputs) == 1 or inputs[0].shape[:-1] == inputs[1].shape
+        assert isinstance(layer, TorchInnerLayer)
+        samples, *args = layer.compute_maximiser(*inputs)
+        if len(args) == 2:  # Sum Layer
+            ev_score, mix_samples = args
+            # if mix_samples is not None:
+            #     mixture_samples.append(mix_samples)
+        else:
+            ev_score = args[0]
+
+        if ev_score is None:
+            return samples,
+
+        return samples, ev_score
+
+    def _pad_samples(self, samples: Tensor, scope_idx: Tensor, value: float = 0) -> Tensor:
+        """Pads univariate samples to the size of the scope of the circuit (output dimension)
+        according to scope for compatibility in downstream inner nodes.
+        """
+        if scope_idx.shape[1] != 1:
+            raise NotImplementedError("Padding is only implemented for univariate samples")
+
+        # padded_samples: (F, K, num_samples, E?, D)
+        padded_samples = torch.ones(
+            (*samples.shape, len(self._circuit.scope)), device=samples.device, dtype=samples.dtype
+        ) * value
+        fold_idx = torch.arange(samples.shape[0], device=samples.device)
+        padded_samples[fold_idx, ..., scope_idx.squeeze(dim=1)] = samples
+        return padded_samples

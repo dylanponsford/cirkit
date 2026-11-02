@@ -173,6 +173,68 @@ class TorchInputLayer(TorchLayer, ABC):
         )
 
 
+    @torch.no_grad()
+    def compute_maximiser_and_eval_evidence(
+        self,
+        evidence: Tensor | None = None,
+        ev_mask: Tensor | None = None
+    ):
+        """
+            This function samples from the input distribution and then fill the entries
+            that correspond to the evidence inputs with their probability (in the layer
+            semiring space)
+        """
+        if evidence is None:
+            return self.compute_maximiser(), None
+
+        # maximiser: (1, F, K) or (E, F, K)
+        maximiser = self.compute_maximiser(evidence, ev_mask)
+        score = self(evidence.where(ev_mask, self.compute_maximiser()[:,:1])) # Replace by valid maxima
+        score[~ev_mask.expand_as(score)] = torch.nan # (E, K)
+        score = score.movedim(-1, -2).unsqueeze(-2) # (1, K, E)
+
+        return maximiser, score
+
+
+    @torch.no_grad()
+    def compute_maximiser(
+        self,
+        evidence: Tensor | None = None,
+        ev_mask: Tensor | None = None
+    ) -> Tensor:
+        r"""If the input layer encodes a probability distribution, then compute the argmax of it.
+
+        Args:
+            evidence: Observed evidence tensor of size [..., K] for conditional sampling.
+            ev_mask: Mask with observed values.
+
+        Returns:
+            Tensor: The tensorized sample, having shape $(F, K)$, where
+                $F$ is the number of folds and $K$ is the number of output units.
+
+        Raises:
+            TypeError: If computing the maximiser is not supported by the layer.
+        """
+        maximiser_shape = (1,) if evidence is None else tuple([1] + list(evidence.shape[1:-1]))
+        # maximiser_shape: (1,) or (1, E)
+        assert self.num_variables == 1 or evidence is None, (
+            "Computing the maximiser is only implemented for uni-dimensional input nodes"
+        )
+
+        # maximiser: (maximiser_shape, F, K)
+        maximiser = self.compute_maximiser_(maximiser_shape)
+
+        rearrange = lambda x: x.flatten(end_dim=-3).flatten(start_dim=1).T.view(x.shape[-2:] + x.shape[:-2])
+        maximiser = rearrange(maximiser) # (F, K, maximiser_shape)
+        return maximiser
+
+    def compute_maximiser_(self, maximiser_shape: tuple[int]) -> Tensor:
+        """
+        TODO
+        """
+        raise TypeError(f"Computing the maximiser is not supported for layers of type {type(self)}")
+
+
 class TorchInputFunctionLayer(TorchInputLayer):
     """An input layer encoding functions defined over a non-empty set of variables."""
 
@@ -499,6 +561,25 @@ class TorchCategoricalLayer(TorchExpFamilyLayer):
         var_indices = self.scope_idx[folds, 0]
         samples[sample_ids, var_indices] = sampled.to(dtype=samples.dtype)  # Cast to dtype
 
+    def compute_maximiser_(self, maximiser_shape: tuple[int]) -> Tensor:
+        """
+        TODO: write docstring
+        """
+        if self.logits is None:
+            assert self.probs is not None
+            logits = torch.log(self.probs())
+        else:
+            logits = self.logits()
+        # logits: (F, K, N)
+        # Take the argmax over N
+        # This gives the mode for each fold and overparameterisation
+        argmax = logits.argmax(dim=-1) # (F, K)
+        if maximiser_shape == (1,):
+            argmax = argmax.unsqueeze(0) # (1, F, K)
+        else:
+            argmax = argmax.unsqueeze(0).repeat(maximiser_shape[1], argmax.shape[0], argmax.shape[1]).unsqueeze(0) # (1, E, F, K)
+        return argmax
+
 
 class TorchBinomialLayer(TorchExpFamilyLayer):
     """The Binomial distribution layer.
@@ -763,6 +844,14 @@ class TorchGaussianLayer(TorchExpFamilyLayer):
         sampled = distributions.Normal(loc=selected_means, scale=selected_stddevs).sample() # (P,)
         var_indices = self.scope_idx[folds, 0]
         samples[sample_ids, var_indices] = sampled
+
+    def compute_maximiser_(self, maximiser_shape: tuple[int]) -> Tensor:
+        mean = self.mean() # (F, K), mode is the same as mean for Gaussian
+        if maximiser_shape == (1,):
+            mean = mean.unsqueeze(0) # (1, F, K)
+        else:
+            mean = mean.unsqueeze(0).repeat(maximiser_shape[1], mean.shape[0], mean.shape[1]).unsqueeze(0) # (1, E, F, K)
+        return mean
 
 
 class TorchConstantValueLayer(TorchConstantLayer):

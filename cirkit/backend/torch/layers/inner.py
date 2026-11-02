@@ -34,28 +34,6 @@ class ArityBranch:
     units: Tensor
 
 
-# (sample_ids, folds, units) — three parallel 1-D tensors of length P, where P is the number
-# of active paths at a layer during top-down (backward) sampling.
-BackwardSelection = tuple[Tensor, Tensor, Tensor]
-
-
-@dataclass
-class ArityBranch:
-    """The local result of `backward_sample` for one arity slot of an inner layer.
-
-    `sample_ids` and `folds` are subsets of the parent's selection (subset = identity
-    when all paths are active at this slot, e.g. Hadamard/CPT). `units` is the unit
-    each path selects in the child at this slot.
-
-    The driver translates `folds` (parent fold) through `entry.in_fold_idx[0]` to find
-    the child concat-fold, then dispatches across children via `entry.in_module_ids[0]`.
-    """
-
-    sample_ids: Tensor
-    folds: Tensor
-    units: Tensor
-
-
 class TorchInnerLayer(TorchLayer, ABC):
     """The abstract base class for inner layers, i.e., either sum or product layers."""
 
@@ -145,6 +123,48 @@ class TorchInnerLayer(TorchLayer, ABC):
         """
         raise TypeError(f"Backward sampling not implemented for {type(self).__name__}")
 
+    def compute_max(self, x: Tensor) -> Tensor:
+        """
+            Compute and return the max of the inputs.
+
+        Args:
+            x: The tensor input to this layer, having shape $(F, H, B, K_i)$, where $F$
+                is the number of folds, $H$ is the arity, $B$ is the batch size, and
+                $K_i$ is the number of input units.
+
+        Returns:
+            Tensor: The tensor output of this layer, having shape $(F, B, K_o)$, where $K_o$
+                is the number of output units.
+
+        Raises:
+            TypeError: If computing the max is not supported by the layer.
+        """
+        raise TypeError(
+            f"Computing the max is not implemented for inner layer {type(self).__name__}"
+        )
+
+    def compute_maximiser(
+            self,
+            x: Tensor,
+            ev_score: Tensor | None = None
+        ) -> tuple[Tensor, Tensor | None]:
+        """
+        
+        Args:
+            evidence: TODO
+            ev_score: A tensor of size $(F, H, C, K, N, D)$ with the evidence scores, with NaNs for
+                unobserved elements.
+
+        Returns:
+            Tensor: A new tensor representing the new variable assignements the layers gives
+                as output.
+            ev_score (?): A tensor propagating observed evidence probabilities forwards (if applicable)
+
+        Raises:
+            TypeError: If sampling is not supported by the layer.
+        """
+        raise TypeError(f"Computing the maximiser is not implemented for {type(self)}")
+
 
 class TorchHadamardLayer(TorchInnerLayer):
     """The Hadamard product layer, which computes an element-wise (or Hadamard) product of
@@ -208,6 +228,20 @@ class TorchHadamardLayer(TorchInnerLayer):
         # Independence across children: broadcast the selection unchanged to every arity slot.
         sample_ids, folds, units = selection
         return [ArityBranch(sample_ids, folds, units) for _ in range(self.arity)]
+
+    @torch.no_grad()
+    def compute_maximiser(self, x: Tensor, ev_score: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+        # Concatenate samples over disjoint variables through a sum
+        # x: (F, H, K, num_samples, D)
+        # All elements but 1 in the H axis will be "1" (in the semiring)
+        x = self.semiring.prod(x, dim=1)  # (F, K, 1, D)
+        if ev_score is None:
+            return x, None
+
+        ev_mask = (~ev_score.isnan()).any(dim=1)
+        ev_score = self.semiring.prod(ev_score.nan_to_num(self.semiring.multiplicative_identity), dim=1)
+        ev_score[~ev_mask.expand_as(ev_score)] = torch.nan
+        return x, ev_score
 
 
 class TorchKroneckerLayer(TorchInnerLayer):
@@ -429,3 +463,59 @@ class TorchSumLayer(TorchInnerLayer):
                 empty = torch.empty(0, dtype=torch.long, device=sample_ids.device)
                 branches.append(ArityBranch(empty, empty, empty))
         return branches
+
+    def compute_maximiser(
+            self,
+            x: Tensor,
+            ev_score: Tensor | None = None
+        ) -> tuple[Tensor, Tensor | None]:
+        # F = Fold, H = Arity, Ki = Input Dim, Ko = Output Dim,
+        # B = Batch size, E = Evidence size, D = Data dim
+        # x:        (F, H, Ki, B, E?, D)
+        # ev_score: (F, H, Ki, B, E)
+        # weight:   (F, Ko, H * Ki)
+        weight = self.weight()
+        if ev_score is not None:
+            # The ev_score is repeated for all B, so just pick the first
+            # Replace observations (samples) with 1s (in the semiring space)
+            score = ev_score.select(3, 0).masked_fill(
+                ev_score.select(3, 0).isnan(),
+                self.semiring.multiplicative_identity
+            )
+            score = score.movedim(-1, 1).flatten(start_dim=2)
+            weight = self.semiring.map_from(weight, SumProductSemiring)
+            weight = self.semiring.mul(weight.unsqueeze(2), score.unsqueeze(1))
+            score = self.semiring.sum(weight, dim=-1, keepdim=True)
+            weight = self.semiring.div(weight, score)
+            weight = SumProductSemiring.map_from(weight, self.semiring)
+
+        negative = torch.any(weight < 0.0)
+        normalized = torch.allclose(torch.sum(weight, dim=-1), torch.ones(1, device=weight.device))
+        # TODO: do we need normalised check for approx. MAP?
+        if negative or not normalized:
+            raise TypeError("Computing the approx. argmax in sum layers only works \
+                            with positive weights summing to 1")
+
+        # x: (F, H, Ki, B, E?, D) -> (F, H * Ki, B, E?, D)
+        x = x.flatten(1, 2)
+
+        num_samples = x.shape[2]
+        d = x.shape[-1]
+
+        mixing_samples = torch.argmax(weight, dim=-1).unsqueeze(0) # (1, F, Ko, E?)
+        mixing_samples = mixing_samples.movedim(0, 2) # (F, Ko, E?, 1)
+
+        # mixing_indices: (F, Ko, E?, B, D)
+        mixing_indices = mixing_samples.unsqueeze(-1).repeat([1] * len(mixing_samples.shape) + [d])
+
+        # x: (F, E?, Ko, B, D)
+        # x: (F, Ko, B, E?, D) 
+        x = torch.gather(x, dim=1, index=mixing_indices)
+
+        # (F, Ko, E, D)
+        if ev_score is not None:
+            ev_mask = (~ev_score.flatten(1,2).isnan()).any(dim=1, keepdim=True)
+            ev_score = score.movedim(-1, -2).expand_as(x[...,0])
+            ev_score[~ev_mask.expand_as(ev_score)] = torch.nan
+
+        return x, ev_score, mixing_samples
